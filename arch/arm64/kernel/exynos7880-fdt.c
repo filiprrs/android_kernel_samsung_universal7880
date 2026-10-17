@@ -70,107 +70,68 @@ static int __init ranges_overlap(unsigned long a, unsigned long alen,
 	return a <= b ? b - a < alen : a - b < blen;
 }
 
-/* Bound old libfdt's reads before using its node/property lookup functions. */
+/* Add board-selection constraints to libfdt's structural validation. */
 int __init exynos7880_dt_validate(const void *dt, unsigned long size)
 {
-	const unsigned char *data = dt;
-	const uint32_t *words;
-	const char *name, *nul;
-	unsigned char children[DT_MAX_DEPTH] = {0};
-	unsigned long total, so, ss, strings, slen, reserve, rlen;
-	unsigned long pos = 0, next, length, nameoff, header;
+	const char *name;
+	unsigned char children[DT_MAX_DEPTH] = { 0 };
+	unsigned long total, so, ss, strings, slen, reserve, rlen, header;
 	uint64_t address, bytes;
 	uint32_t tag;
-	int depth = 0, root = 0, ended = 0, node, property, ret;
+	int depth = 0, offset = 0, next, node, property, ret, root = 0;
 	char path[DT_PATH_SIZE];
 
 	if (!dt || ((unsigned long)dt & 7) || size < FDT_V17_SIZE)
 		return -EINVAL;
-	if (fdt_check_header(dt) || fdt_magic(dt) != FDT_MAGIC)
-		return -EINVAL;
 	total = fdt_totalsize(dt);
-	if (total > size || total < FDT_V17_SIZE || total > DT_MAX_SIZE)
-		return -EINVAL;
-	header = fdt_version(dt) >= 17 ? FDT_V17_SIZE : FDT_V16_SIZE;
-	so = fdt_off_dt_struct(dt);
-	strings = fdt_off_dt_strings(dt);
-	slen = fdt_size_dt_strings(dt);
-	reserve = fdt_off_mem_rsvmap(dt);
-	if (so < header || so > total || (so & 3) || strings < header ||
-	    !window(total, strings, slen) || reserve < header || (reserve & 7))
-		return -EINVAL;
-	ss = fdt_version(dt) >= 17 ? fdt_size_dt_struct(dt) : total - so;
-	if (!window(total, so, ss))
+	if (total > size || total < FDT_V17_SIZE || total > DT_MAX_SIZE ||
+	    fdt_check_full(dt, size))
 		return -EINVAL;
 
-	while (window(ss, pos, 4)) {
-		words = (const uint32_t *)(data + so + pos);
-		tag = fdt32_to_cpu(words[0]);
-		next = pos + 4;
-		switch (tag) {
-		case FDT_BEGIN_NODE:
-			name = (const char *)data + so + next;
-			nul = memchr(name, 0, ss - next);
-			if (!nul || memchr(name, '/', nul - name) ||
-			    depth == DT_MAX_DEPTH)
-				return -EINVAL;
-			if (!depth && (root || *name))
+	/* Keep bounded depth and properties before child nodes. */
+	for (;;) {
+		tag = fdt_next_tag(dt, offset, &next);
+		if (next < 0)
+			return -EINVAL;
+		if (tag == FDT_BEGIN_NODE) {
+			if (depth == DT_MAX_DEPTH)
 				return -EINVAL;
 			if (depth)
 				children[depth - 1] = 1;
 			children[depth++] = 0;
 			root = 1;
-			next += nul - name + 1;
-			break;
-		case FDT_PROP:
-			if (!depth || children[depth - 1] ||
-			    !window(ss, pos, sizeof(struct fdt_property)))
+		} else if (tag == FDT_PROP) {
+			if (!depth || children[depth - 1])
 				return -EINVAL;
-			length = fdt32_to_cpu(words[1]);
-			nameoff = fdt32_to_cpu(words[2]);
-			next = pos + sizeof(struct fdt_property);
-			if (!window(ss, next, length) || nameoff >= slen)
-				return -EINVAL;
-			name = (const char *)data + strings + nameoff;
-			if (!*name || !memchr(name, 0, slen - nameoff))
-				return -EINVAL;
-			next += length;
-			break;
-		case FDT_END_NODE:
+		} else if (tag == FDT_END_NODE) {
 			if (!depth)
 				return -EINVAL;
 			depth--;
-			break;
-		case FDT_END:
+		} else if (tag == FDT_END) {
 			if (depth || !root)
 				return -EINVAL;
-			ended = 1;
 			break;
-		case FDT_NOP:
-			break;
-		default:
-			return -EINVAL;
 		}
-		next = (next + 3) & ~3UL;
-		if (next > ss)
-			return -EINVAL;
-		pos = next;
-		if (ended)
-			break;
+		offset = next;
 	}
-	if (!ended)
+
+	header = fdt_header_size(dt);
+	so = fdt_off_dt_struct(dt);
+	ss = fdt_version(dt) >= 17 ? fdt_size_dt_struct(dt) : next;
+	strings = fdt_off_dt_strings(dt);
+	slen = fdt_size_dt_strings(dt);
+	reserve = fdt_off_mem_rsvmap(dt);
+	if (so < header || (so & 3) || strings < header ||
+	    !window(total, so, ss) || !window(total, strings, slen) ||
+	    reserve < header || (reserve & 7) ||
+	    ranges_overlap(so, ss, strings, slen))
 		return -EINVAL;
-	if (fdt_version(dt) < 17)
-		ss = pos;
-	if (ranges_overlap(so, ss, strings, slen))
-		return -EINVAL;
-	for (rlen = 0;; rlen += 16) {
-		if (!window(total, reserve, rlen + 16))
+
+	/* Reject overlapping blocks and overflowing reservations. */
+	for (rlen = 0; ; rlen += 16) {
+		if (!window(total, reserve, rlen + 16) ||
+		    fdt_get_mem_rsv(dt, rlen / 16, &address, &bytes))
 			return -EINVAL;
-		memcpy(&address, data + reserve + rlen, 8);
-		memcpy(&bytes, data + reserve + rlen + 8, 8);
-		address = fdt64_to_cpu(address);
-		bytes = fdt64_to_cpu(bytes);
 		if (!address && !bytes) {
 			rlen += 16;
 			break;
@@ -193,9 +154,9 @@ int __init exynos7880_dt_validate(const void *dt, unsigned long size)
 		while (property >= 0) {
 			const void *value;
 
-			value = fdt_getprop_by_offset(dt, property, &name,
-						      NULL);
-			if (!value ||
+			value = fdt_getprop_by_offset(dt, property,
+						      &name, NULL);
+			if (!value || !*name ||
 			    value != fdt_getprop(dt, node, name, NULL))
 				return -EINVAL;
 			property = fdt_next_property_offset(dt, property);

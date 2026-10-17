@@ -29,6 +29,10 @@ catalogue copy. Recognized changes to chosen, memory, reserved-memory, ECT,
 serial-number and MAC properties are replayed onto the selected board tree.
 The header reservation map and boot CPU ID are preserved as well.
 
+DT structure checks use libfdt 1.7.2 with its upstream trailing-NOP fix.
+Board selection additionally rejects duplicate paths and properties,
+overlapping data blocks, overflowing reservations and excessive nesting.
+
 This is deliberately not a general overlay mechanism. Unknown firmware
 changes, changes to phandle declarations, incompatible boot-data layouts,
 ambiguous identities and malformed trees are rejected. Board-specific
